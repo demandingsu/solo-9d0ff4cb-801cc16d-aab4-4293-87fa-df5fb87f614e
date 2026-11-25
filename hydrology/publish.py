@@ -22,7 +22,7 @@ import json
 from typing import Any, Mapping, Optional
 
 from .db import connect, immediate, load_current, now_iso
-from .domain import parse_range, parse_rules, verify
+from .domain import RANGE_KEYS, parse_range, parse_rules, verify
 
 VALID_KINDS = ("ranges", "rules", "bundle")
 
@@ -32,6 +32,153 @@ KIND_LABELS = {
     "bundle": "量程 + 分区表一并发布",
     "seed": "初始播种",
 }
+
+# 候选稿格式版本。旧稿没有这个字段：改版前网页表单里量程与规则行共用
+# ``wl_min`` 等字段名，提交时每行区间会整体串到下一行，最后一行区间丢失。
+CANDIDATE_SCHEMA = 2
+
+# 载回旧版网页稿时的说明。
+LEGACY_WEB_RULES_WARNING = (
+    "这是一份旧版网页稿：提交时每行区间曾整体串到下一行。"
+    "能确认归属的区间已回到对应行；最后一行区间在旧稿中没有保存下来，已留空，"
+    "请补填后再提交。"
+)
+MISSING_SECTION_WARNING = "该稿没有保存这一部分内容，已留空，请补填后再提交。"
+
+# 规则编辑器中参与“缺项”判定的字段（按页面展示顺序）。
+EDITOR_RULE_KEYS = ("zone", "priority") + RANGE_KEYS
+
+
+def build_candidate(
+    kind: str,
+    range_data: Optional[Mapping[str, Any]],
+    rules_data: Any,
+) -> dict[str, Any]:
+    """构造留档候选稿，只保存本次提交动作实际送审的部分。"""
+    candidate: dict[str, Any] = {
+        "candidate_schema": CANDIDATE_SCHEMA,
+        "kind": kind,
+    }
+    if kind in ("ranges", "bundle"):
+        candidate["range"] = range_data
+    if kind in ("rules", "bundle"):
+        candidate["rules"] = rules_data
+    return candidate
+
+
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and value.strip() == "")
+
+
+def _normalise_rules(raw_rules: Any) -> list[dict[str, Any]]:
+    """把留档的规则列表整理成编辑器行（字段缺失保留为空）。"""
+    rows: list[dict[str, Any]] = []
+    if not isinstance(raw_rules, (list, tuple)):
+        return rows
+    for item in raw_rules:
+        if not isinstance(item, Mapping):
+            rows.append({key: None for key in ("id",) + EDITOR_RULE_KEYS})
+            continue
+        row: dict[str, Any] = {"id": item.get("id", item.get("rule_id"))}
+        for key in EDITOR_RULE_KEYS:
+            row[key] = item.get(key)
+        rows.append(row)
+    return rows
+
+
+def _restore_legacy_web_rules(raw_rules: Any) -> list[dict[str, Any]]:
+    """还原旧版网页稿的规则区间。
+
+    旧表单中量程编辑器与规则行共用 ``wl_min`` 等字段名，浏览器按文档顺序
+    提交同名值，于是留档的第 ``i`` 行（``i >= 1``）拿到的是原第 ``i-1`` 行
+    的区间，原第 0 行拿到的是量程值，原末行的区间溢出丢失。这里把能确认
+    归属的区间下移回对应行；原末行区间无法找回，留空待补填。
+    """
+    rows = _normalise_rules(raw_rules)
+    restored: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows):
+        item: dict[str, Any] = {
+            "id": row.get("id"),
+            "zone": row.get("zone"),
+            "priority": row.get("priority"),
+        }
+        if idx + 1 < len(rows):
+            source = rows[idx + 1]
+            for key in RANGE_KEYS:
+                item[key] = source.get(key)
+        else:
+            # 原末行的区间在旧稿中从未被保存。
+            for key in RANGE_KEYS:
+                item[key] = ""
+        restored.append(item)
+    return restored
+
+
+def _incomplete_rows(rules: list[Mapping[str, Any]]) -> list[int]:
+    """返回存在缺项的规则行号（从 1 开始）。"""
+    return [
+        idx
+        for idx, row in enumerate(rules, start=1)
+        if any(_is_blank(row.get(key)) for key in EDITOR_RULE_KEYS)
+    ]
+
+
+def build_restore_draft(attempt: Mapping[str, Any]) -> dict[str, Any]:
+    """把一笔被驳回稿转成编辑器初值（待编辑副本，不写库）。
+
+    * 只带回原提交动作实际送审的部分（量程 / 分区表）；
+    * 新版网页稿与 API 稿按原值载回；
+    * 旧版网页稿按旧表单的错行方式还原，丢失区间留空并提示补填。
+    """
+    draft: dict[str, Any] = {
+        "kind": attempt.get("kind"),
+        "range": None,
+        "rules": None,
+        "warnings": [],
+        "missing_rows": [],
+        "legacy_web": False,
+        "range_missing": False,
+    }
+
+    data: dict[str, Any] = {}
+    candidate_json = attempt.get("candidate_json")
+    if candidate_json:
+        try:
+            loaded = json.loads(candidate_json)
+        except (ValueError, TypeError):
+            loaded = None
+        if isinstance(loaded, dict):
+            data = loaded
+
+    kind = attempt.get("kind")
+    schema = data.get("candidate_schema")
+    is_legacy_web = schema is None and attempt.get("source") == "web"
+
+    if kind in ("ranges", "bundle"):
+        raw_range = data.get("range")
+        if isinstance(raw_range, Mapping):
+            draft["range"] = {key: raw_range.get(key) for key in RANGE_KEYS}
+        else:
+            draft["range"] = {key: "" for key in RANGE_KEYS}
+            draft["warnings"].append(MISSING_SECTION_WARNING)
+        draft["range_missing"] = any(
+            _is_blank(draft["range"].get(key)) for key in RANGE_KEYS
+        )
+
+    if kind in ("rules", "bundle"):
+        raw_rules = data.get("rules")
+        if not isinstance(raw_rules, (list, tuple)):
+            draft["rules"] = []
+            draft["warnings"].append(MISSING_SECTION_WARNING)
+        elif is_legacy_web:
+            draft["rules"] = _restore_legacy_web_rules(raw_rules)
+            draft["legacy_web"] = True
+            draft["warnings"].append(LEGACY_WEB_RULES_WARNING)
+        else:
+            draft["rules"] = _normalise_rules(raw_rules)
+        draft["missing_rows"] = _incomplete_rows(draft["rules"])
+
+    return draft
 
 
 def submit_publish(
@@ -49,7 +196,7 @@ def submit_publish(
 
     note = (note or "").strip()[:200]
     candidate_json = json.dumps(
-        {"kind": kind, "range": range_data, "rules": rules_data},
+        build_candidate(kind, range_data, rules_data),
         ensure_ascii=False,
         default=str,
     )

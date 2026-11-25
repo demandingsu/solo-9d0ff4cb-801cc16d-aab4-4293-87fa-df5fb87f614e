@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import sys
 import tempfile
 import threading
@@ -248,7 +249,134 @@ def main() -> int:
     )
 
     # ------------------------------------------------------------------ #
-    banner("5. 页面冒烟")
+    banner("5. 发布页：规则区间按各行原填值核对 / 留档 / 生效")
+    # ------------------------------------------------------------------ #
+    from werkzeug.datastructures import MultiDict
+
+    def rule_form(action, rows, rng=(0, 100, 0, 1000)):
+        data = MultiDict(
+            [
+                ("action", action),
+                ("wl_min", str(rng[0])), ("wl_max", str(rng[1])),
+                ("fl_min", str(rng[2])), ("fl_max", str(rng[3])),
+            ]
+        )
+        for zone, prio, w0, w1, f0, f1 in rows:
+            data.add("rule_id", "")
+            data.add("rule_zone", zone)
+            data.add("rule_priority", str(prio))
+            data.add("rule_wl_min", str(w0))
+            data.add("rule_wl_max", str(w1))
+            data.add("rule_fl_min", str(f0))
+            data.add("rule_fl_max", str(f1))
+        return data
+
+    # 第 3 节已把现行量程扩到 0..200，分区表需盖满届时量程才能通过。
+    wide_rows = [("左区", 10, 0, 49, 0, 1000), ("右区", 10, 50, 200, 0, 1000)]
+    resp = client.post("/publish", data=rule_form("rules", wide_rows))
+    current_rules = client.get("/api/current").get_json()["rules"]
+    intervals = [(r["zone"], r["wl_interval"]) for r in current_rules]
+    check(
+        "仅分区表：各行区间原样生效（不错行）",
+        intervals == [("左区", [0, 49]), ("右区", [50, 200])],
+        str(intervals),
+    )
+    left = client.get("/api/classify?wl=10&flow=500").get_json()
+    right = client.get("/api/classify?wl=90&flow=500").get_json()
+    check(
+        "发布后归属落在各行原填区间",
+        left.get("zone") == "左区" and right.get("zone") == "右区",
+        f"(10,500)->{left.get('zone')}, (90,500)->{right.get('zone')}",
+    )
+
+    # 一并发布：量程与分区表成对提交，核对与生效都应使用原填区间。
+    two_rows = [("左区", 10, 0, 49, 0, 1000), ("右区", 10, 50, 100, 0, 1000)]
+    resp = client.post("/publish", data=rule_form("bundle", two_rows))
+    detail = client.get(resp.headers["Location"]).data.decode()
+    check("一并发布按各行原填区间通过核对", "核对通过" in detail)
+    zones = [
+        (r["zone"], r["wl_interval"])
+        for r in client.get("/api/current").get_json()["rules"]
+    ]
+    check(
+        "一并发布后归属仍对应原填区间",
+        zones == [("左区", [0, 49]), ("右区", [50, 100])],
+        str(zones),
+    )
+
+    # 载回：仅分区表稿只带回分区表，不夹带量程候选。
+    resp = client.post(
+        "/publish",
+        data=rule_form("rules", [("左区", 10, 0, 49, 0, 1000), ("右区", 10, 50, 100, 0, "")]),
+    )
+    aid = int(resp.headers["Location"].rstrip("/").split("/")[-1])
+    html = client.get(f"/publish?restore={aid}").data.decode()
+    check("载回新版网页稿带回各行原值并提示补填",
+          "右区" in html and "行仍有缺项" in html)
+
+    # ------------------------------------------------------------------ #
+    banner("6. 旧版网页稿：能确认归属的区间回行，丢失的留空提示补填")
+    # ------------------------------------------------------------------ #
+    from hydrology.db import connect as db_connect
+
+    legacy_rules = [
+        {"zone": "旧甲区", "priority": "10", "id": "",
+         "wl_min": "0", "wl_max": "100", "fl_min": "0", "fl_max": "1000"},
+        {"zone": "旧乙区", "priority": "10", "id": "",
+         "wl_min": "0", "wl_max": "49", "fl_min": "0", "fl_max": "1000"},
+    ]
+    conn = db_connect(app.config["DATABASE"])
+    conn.execute("BEGIN IMMEDIATE")
+    cur = conn.execute(
+        """INSERT INTO publish_attempts
+           (created_at, kind, source, accepted, note, report_json, candidate_json)
+           VALUES ('2026-01-01T00:00:00+00:00', 'rules', 'web', 0, '旧稿', ?, ?)""",
+        ('{"ok": false, "structural_errors": [], "gap": null, "tie": null}',
+         json.dumps({"kind": "rules", "range": None, "rules": legacy_rules},
+                    ensure_ascii=False)),
+    )
+    legacy_id = cur.lastrowid
+    conn.execute("COMMIT")
+    conn.close()
+
+    html = client.get(f"/publish?restore={legacy_id}").data.decode()
+    check("旧稿提示补填", "旧版网页稿" in html and "请补填" in html)
+    check(
+        "可确认归属的区间回到对应行",
+        'name="rule_zone" value="旧甲区"' in html
+        and 'name="rule_wl_max" class="num" value="49"' in html,
+    )
+    check(
+        "丢失的末行区间留空",
+        'name="rule_zone" value="旧乙区"' in html
+        and 'name="rule_wl_min" class="num" value=""' in html,
+    )
+
+    rid_before, vid_before = (
+        client.get("/api/current").get_json()["range_version_id"],
+        client.get("/api/current").get_json()["rules_version_id"],
+    )
+    resp = client.post(
+        "/publish",
+        data=rule_form("rules", [("旧甲区", 10, 0, 49, 0, 1000),
+                                 ("旧乙区", 10, "", "", "", "")]),
+    )
+    body = client.get(resp.headers["Location"]).data.decode()
+    ids_after = client.get("/api/current").get_json()
+    check("缺项未补即提交被驳回且指针不动",
+          "驳回" in body
+          and (ids_after["range_version_id"], ids_after["rules_version_id"])
+          == (rid_before, vid_before))
+    resp = client.post(
+        "/publish",
+        data=rule_form("rules", [("旧甲区", 10, 0, 49, 0, 1000),
+                                 ("旧乙区", 10, 50, 100, 0, 1000)]),
+    )
+    body = client.get(resp.headers["Location"]).data.decode()
+    check("补齐后仍按现有核对流程通过", "核对通过" in body)
+
+    # ------------------------------------------------------------------ #
+    banner("7. 页面冒烟")
     # ------------------------------------------------------------------ #
     for path, token in [
         ("/", "现行分区表"),

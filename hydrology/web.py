@@ -15,9 +15,27 @@ from flask import (
 
 from .db import get_attempt, get_db, list_attempts, load_current
 from .domain import RANGE_KEYS, coerce_pair, classify_pair
-from .publish import KIND_LABELS, VALID_KINDS, submit_publish
+from .publish import (
+    KIND_LABELS,
+    VALID_KINDS,
+    build_restore_draft,
+    submit_publish,
+)
 
 bp = Blueprint("web", __name__)
+
+# 规则行的表单字段名统一加 ``rule_`` 前缀，避免与上方量程编辑器的
+# ``wl_min`` / ``wl_max`` / ``fl_min`` / ``fl_max`` 同名。此前两者同名，
+# 浏览器按文档顺序提交全部同名值，规则行会整体错位一行、末行区间丢失，
+# 导致核对的区间和最终生效的区间都不是各行原填值。
+RULE_FORM_KEYS = {
+    "zone": "rule_zone",
+    "priority": "rule_priority",
+    "wl_min": "rule_wl_min",
+    "wl_max": "rule_wl_max",
+    "fl_min": "rule_fl_min",
+    "fl_max": "rule_fl_max",
+}
 
 
 @bp.app_template_filter("from_json")
@@ -68,10 +86,10 @@ def _range_data_from_form(form) -> dict[str, str]:
 
 
 def _rules_data_from_form(form) -> list[dict[str, str]]:
-    zones = form.getlist("zone")
-    priorities = form.getlist("priority")
+    zones = form.getlist(RULE_FORM_KEYS["zone"])
+    priorities = form.getlist(RULE_FORM_KEYS["priority"])
     rule_ids = form.getlist("rule_id")
-    columns = {key: form.getlist(key) for key in RANGE_KEYS}
+    columns = {key: form.getlist(RULE_FORM_KEYS[key]) for key in RANGE_KEYS}
     rules: list[dict[str, str]] = []
     for i, zone in enumerate(zones):
         item = {
@@ -96,6 +114,7 @@ def publish_page():
                 editor_range=None,
                 editor_rules=None,
                 restore=None,
+                restore_draft=None,
                 fatal=f"无效的发布动作：{action!r}",
             ), 400
 
@@ -115,15 +134,17 @@ def publish_page():
     editor_range = None
     editor_rules = None
     restore = None
+    restore_draft = None
 
     restore_id = request.args.get("restore", type=int)
     if restore_id:
         attempt = get_attempt(get_db(), restore_id)
         if attempt and attempt["candidate_json"]:
-            candidate = json.loads(attempt["candidate_json"])
+            draft = build_restore_draft(attempt)
             restore = attempt
-            editor_range = candidate.get("range")
-            editor_rules = candidate.get("rules")
+            restore_draft = draft
+            editor_range = draft["range"]
+            editor_rules = draft["rules"]
 
     return render_template(
         "publish.html",
@@ -131,6 +152,7 @@ def publish_page():
         editor_range=editor_range,
         editor_rules=editor_rules,
         restore=restore,
+        restore_draft=restore_draft,
         fatal=None,
     )
 

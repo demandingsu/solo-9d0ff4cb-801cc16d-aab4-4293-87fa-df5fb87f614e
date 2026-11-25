@@ -16,6 +16,20 @@
     <div class="panel panel-warn">
       已载回第 <strong>#{{ restore.id }}</strong> 笔被驳回提交（{{ restore.kind|kind_label }}）的内容，
       修改后可再次提交。
+      {% if restore_draft and restore_draft.warnings %}
+        <ul class="warn-list">
+          {% for w in restore_draft.warnings %}<li>{{ w }}</li>{% endfor %}
+        </ul>
+      {% endif %}
+      {% if restore_draft and restore_draft.missing_rows %}
+        <p>第
+          {% for row_no in restore_draft.missing_rows %}<strong>{{ row_no }}</strong>{{ '、' if not loop.last }}{% endfor %}
+          行仍有缺项，提交会被驳回，请先补齐。
+        </p>
+      {% endif %}
+      {% if restore_draft and restore_draft.range_missing %}
+        <p>有效量程仍有缺项，提交会被驳回，请先补齐。</p>
+      {% endif %}
     </div>
   {% endif %}
   {% if fatal %}
@@ -69,15 +83,15 @@
         <tbody id="rules-tbody">
           {% for r in erules %}
             <tr class="rule-row">
-              <td class="row-ord">{{ loop.index }}
+              <td class="row-ord"><span class="row-no">{{ loop.index }}</span>
                 <input type="hidden" name="rule_id" value="{{ r.id if r.id is not none else '' }}">
               </td>
-              <td><input type="text" name="zone" value="{{ r.zone or '' }}"></td>
-              <td><input type="text" inputmode="numeric" name="priority" class="num" value="{{ r.priority if r.priority is not none else '' }}"></td>
-              <td><input type="text" inputmode="numeric" name="wl_min" class="num" value="{{ r.wl_min if r.wl_min is not none else '' }}"></td>
-              <td><input type="text" inputmode="numeric" name="wl_max" class="num" value="{{ r.wl_max if r.wl_max is not none else '' }}"></td>
-              <td><input type="text" inputmode="numeric" name="fl_min" class="num" value="{{ r.fl_min if r.fl_min is not none else '' }}"></td>
-              <td><input type="text" inputmode="numeric" name="fl_max" class="num" value="{{ r.fl_max if r.fl_max is not none else '' }}"></td>
+              <td><input type="text" name="rule_zone" value="{{ r.zone or '' }}"></td>
+              <td><input type="text" inputmode="numeric" name="rule_priority" class="num" value="{{ r.priority if r.priority is not none else '' }}"></td>
+              <td><input type="text" inputmode="numeric" name="rule_wl_min" class="num" value="{{ r.wl_min if r.wl_min is not none else '' }}"></td>
+              <td><input type="text" inputmode="numeric" name="rule_wl_max" class="num" value="{{ r.wl_max if r.wl_max is not none else '' }}"></td>
+              <td><input type="text" inputmode="numeric" name="rule_fl_min" class="num" value="{{ r.fl_min if r.fl_min is not none else '' }}"></td>
+              <td><input type="text" inputmode="numeric" name="rule_fl_max" class="num" value="{{ r.fl_max if r.fl_max is not none else '' }}"></td>
               <td><button type="button" class="btn btn-small btn-danger-outline remove-rule">删除</button></td>
             </tr>
           {% endfor %}
@@ -87,15 +101,15 @@
 
     <template id="rule-row-template">
       <tr class="rule-row">
-        <td class="row-ord">
+        <td class="row-ord"><span class="row-no"></span>
           <input type="hidden" name="rule_id" value="">
         </td>
-        <td><input type="text" name="zone" value=""></td>
-        <td><input type="text" inputmode="numeric" name="priority" class="num" value="10"></td>
-        <td><input type="text" inputmode="numeric" name="wl_min" class="num" value="0"></td>
-        <td><input type="text" inputmode="numeric" name="wl_max" class="num" value="0"></td>
-        <td><input type="text" inputmode="numeric" name="fl_min" class="num" value="0"></td>
-        <td><input type="text" inputmode="numeric" name="fl_max" class="num" value="0"></td>
+        <td><input type="text" name="rule_zone" value=""></td>
+        <td><input type="text" inputmode="numeric" name="rule_priority" class="num" value="10"></td>
+        <td><input type="text" inputmode="numeric" name="rule_wl_min" class="num" value="0"></td>
+        <td><input type="text" inputmode="numeric" name="rule_wl_max" class="num" value="0"></td>
+        <td><input type="text" inputmode="numeric" name="rule_fl_min" class="num" value="0"></td>
+        <td><input type="text" inputmode="numeric" name="rule_fl_max" class="num" value="0"></td>
         <td><button type="button" class="btn btn-small btn-danger-outline remove-rule">删除</button></td>
       </tr>
     </template>
@@ -138,7 +152,8 @@ GET  /api/classify?wl=90&amp;flow=900</pre>
   function renumber() {
     var rows = tbody.querySelectorAll('tr.rule-row');
     rows.forEach(function (tr, i) {
-      var cell = tr.querySelector('.row-ord');
+      // 只改行号文字，不能动 <td> 的 textContent，否则会连隐藏的 rule_id 一起清掉。
+      var cell = tr.querySelector('.row-no');
       if (cell) cell.textContent = i + 1;
     });
   }
